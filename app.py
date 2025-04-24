@@ -100,7 +100,15 @@ if st.button("Run Matching") and job_description and uploaded_files:
         resume_names = []
         for file in uploaded_files:
             try:
-                text = extract_text_from_pdf(file) if file.name.endswith(".pdf") else extract_text_from_docx(file)
+                from io import BytesIO
+
+                file_bytes = BytesIO(file.read())
+                file.seek(0)  # reset for future reads
+
+                if file.name.endswith(".pdf"):
+                    text = extract_text_from_pdf(file_bytes)
+                else:
+                    text = extract_text_from_docx(file_bytes)
                 resume_texts.append(text)
                 resume_names.append(file.name)
             except Exception as e:
