@@ -21,14 +21,6 @@ def extract_text_from_docx(file: BytesIO) -> str:
     doc = docx.Document(file)
     return "\n".join([para.text for para in doc.paragraphs])
 
-def get_embedding(text: str) -> List[float]:
-    response = openai.embeddings.create(input=text, model="text-embedding-ada-002")
-    return response.data[0].embedding
-
-def compute_similarity(job_emb: List[float], res_emb: List[List[float]]) -> List[float]:
-    from sklearn.metrics.pairwise import cosine_similarity
-    return cosine_similarity([job_emb], res_emb)[0]
-
 def extract_email(text: str) -> str:
     match = re.search(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", text)
     return match.group(0) if match else "Not found"
@@ -39,50 +31,25 @@ def extract_profile_url(text: str) -> str:
     github = next((url for url in urls if "github.com" in url), None)
     return linkedin or github or ""
 
-def match_skills(text: str, keywords: List[str]) -> float:
-    text_lower = text.lower()
-    matches = [kw for kw in keywords if kw.lower() in text_lower]
-    return len(matches) / len(keywords) if keywords else 0
-
-def get_level_scores(job_description: str, resume_text: str) -> tuple:
-    skill_keywords = ["python", "javascript", "html", "css", "sql", "java", "c++", "react", "node.js", "git", "linux"]
-    level_1_score = match_skills(resume_text, skill_keywords)
-    level_1_reason = f"- Matched {int(level_1_score * len(skill_keywords))} of {len(skill_keywords)} core skills."
-
+def extract_structured_fields(role: str, mode: str) -> str:
     prompt = (
-        "Evaluate this resume against the job description across:\n"
-        "- Level 2 (Contextual Experience): What is the job actually trying to accomplish? "
-        "Think about the role's goals — like building a chatbot, integrating with Slack, or developing a full-stack system. "
-        "Has the candidate done real work that maps to those goals? Focus on implementation and project relevance. "
-        "Ignore tool names and keywords — evaluate based on the depth and relevance of the experience to the job’s intent.\n"
-        "- Level 3 (Soft Skills): Inferred from how the resume is written and structured. Consider the clarity and articulation of project descriptions, use of the STAR method, quantitative results, and the number and depth of personal or academic projects. "
-        "Since these are students, focus on communication ability, initiative, and whether the resume demonstrates thoughtfulness, organization, and effort.\n\n"
-        f"Job Description:\n{job_description[:1000]}\n\n"
-        f"Resume:\n{resume_text[:1000]}\n\n"
-        "Return a JSON object with the following keys:\n"
-        '{"level_2_score": float, "level_2_reason": str, '
-        '"level_3_score": float, "level_3_reason": str}'
+        f"Extract the {mode} section from this {'resume' if mode != 'job' else 'job description'}.\n"
+        f"Return a clean summary suitable for semantic comparison.\n\n"
+        f"{'Resume' if mode != 'job' else 'Job Description'}:\n{role[:2000]}"
     )
-
     response = openai.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
+        temperature=0.2,
         max_tokens=300
     )
-    content = response.choices[0].message.content.strip()
-    try:
-        result = eval(content) if content.startswith("{") else {}
-        level_2 = float(result.get("level_2_score", 0))
-        level_3 = float(result.get("level_3_score", 0))
-        return (
-            level_1_score, level_2, level_3,
-            level_1_reason.strip(),
-            result.get("level_2_reason", "").strip(),
-            result.get("level_3_reason", "").strip()
-        )
-    except Exception:
-        return level_1_score, 0.0, 0.0, level_1_reason, "N/A", "N/A"
+    return response.choices[0].message.content.strip()
+
+def embed_text(text: str) -> List[float]:
+    return openai.embeddings.create(input=text, model="text-embedding-ada-002").data[0].embedding
+
+def get_cosine_similarity(a: List[float], b: List[float]) -> float:
+    return cosine_similarity([a], [b])[0][0]
 
 # --- UI ---
 
@@ -92,42 +59,56 @@ job_description = st.text_area("Paste the job description here", height=200)
 
 uploaded_files = st.file_uploader("Upload resumes (PDF/DOCX)", type=["pdf", "docx"], accept_multiple_files=True)
 
+st.subheader("⚖️ Weight Configuration")
+w1 = st.slider("🔑 Level 1: Skills Match", 0.0, 1.0, 0.5)
+w2 = st.slider("💼 Level 2: Experience Match", 0.0, 1.0, 0.3)
+w3 = st.slider("✨ Level 3: Soft Skills Inference", 0.0, 1.0, 0.2)
+total = w1 + w2 + w3
+w1, w2, w3 = w1 / total, w2 / total, w3 / total  # normalize to sum to 1
+
 if st.button("Run Matching") and job_description and uploaded_files:
     with st.spinner("Processing..."):
-        job_emb = get_embedding(job_description)
-
         resume_texts = []
         resume_names = []
         for file in uploaded_files:
             try:
-                from io import BytesIO
-
-                file_bytes = BytesIO(file.read())
-                file.seek(0)  # reset for future reads
-
-                if file.name.endswith(".pdf"):
-                    text = extract_text_from_pdf(file_bytes)
-                else:
-                    text = extract_text_from_docx(file_bytes)
+                text = extract_text_from_pdf(file) if file.name.endswith(".pdf") else extract_text_from_docx(file)
                 resume_texts.append(text)
                 resume_names.append(file.name)
             except Exception as e:
                 st.error(f"Error processing {file.name}: {e}")
 
+        jd_keywords = extract_structured_fields(job_description, "keywords")
+        jd_experience = extract_structured_fields(job_description, "experience")
+        jd_soft = extract_structured_fields(job_description, "soft skills")
+
+        jd_kw_emb = embed_text(jd_keywords)
+        jd_exp_emb = embed_text(jd_experience)
+        jd_soft_emb = embed_text(jd_soft)
+
         results = []
-        for name, text in zip(resume_names, resume_texts):
+
+        for file, name, text in zip(uploaded_files, resume_names, resume_texts):
             email = extract_email(text)
             url = extract_profile_url(text)
-            level_1, level_2, level_3, r1, r2, r3 = get_level_scores(job_description, text)
-            weighted_score = 0.5 * level_1 + 0.35 * level_2 + 0.15 * level_3
-            results.append((name, weighted_score, level_1, level_2, level_3, r1, r2, r3, email, url))
+
+            r_keywords = extract_structured_fields(text, "keywords")
+            r_experience = extract_structured_fields(text, "experience")
+            r_soft = extract_structured_fields(text, "soft skills")
+
+            kw_score = get_cosine_similarity(embed_text(r_keywords), jd_kw_emb)
+            exp_score = get_cosine_similarity(embed_text(r_experience), jd_exp_emb)
+            soft_score = get_cosine_similarity(embed_text(r_soft), jd_soft_emb)
+            final_score = w1 * kw_score + w2 * exp_score + w3 * soft_score
+
+            results.append((name, final_score, kw_score, exp_score, soft_score, email, url))
 
         results.sort(key=lambda x: x[1], reverse=True)
         st.success("Matching complete!")
 
         st.subheader("📋 Top Matches")
         for tup in results:
-            name, score, level_1, level_2, level_3, r1, r2, r3, email, url = tup
+            name, score, level_1, level_2, level_3, email, url = tup
             score_color = "#27ae60" if score > 0.85 else "#e67e22" if score > 0.7 else "#c0392b"
             st.markdown(f"""
                 <div style="padding: 15px; border-radius: 8px; background-color: #1e1e1e; margin-bottom: 12px; border: 1px solid #333;">
@@ -138,22 +119,13 @@ if st.button("Run Matching") and job_description and uploaded_files:
                         <strong>Profile URL:</strong> {url if url else "N/A"}
                     </p>
                     <details style="margin-top: 6px;">
-                        <summary style="color: #888; font-size: 12px;">ℹ️ Level 1 (Skills): {level_1:.2f}</summary>
-                        <div style="color: #ccc; font-size: 12px; margin-top: 4px;">
-                            {r1}
-                        </div>
+                        <summary style="color: #888; font-size: 12px;">ℹ️ Level 1 (Keywords): {level_1:.2f}</summary>
                     </details>
                     <details style="margin-top: 6px;">
                         <summary style="color: #888; font-size: 12px;">ℹ️ Level 2 (Experience): {level_2:.2f}</summary>
-                        <div style="color: #ccc; font-size: 12px; margin-top: 4px;">
-                            {r2}
-                        </div>
                     </details>
                     <details style="margin-top: 6px;">
                         <summary style="color: #888; font-size: 12px;">ℹ️ Level 3 (Soft Skills): {level_3:.2f}</summary>
-                        <div style="color: #ccc; font-size: 12px; margin-top: 4px;">
-                            {r3}
-                        </div>
                     </details>
                 </div>
             """, unsafe_allow_html=True)
@@ -161,8 +133,7 @@ if st.button("Run Matching") and job_description and uploaded_files:
         # CSV Export
         df = pd.DataFrame(results, columns=[
             "Resume Name", "Match Score",
-            "Level 1 Score", "Level 2 Score", "Level 3 Score",
-            "Level 1 Rationale", "Level 2 Rationale", "Level 3 Rationale",
+            "Level 1: Keywords", "Level 2: Experience", "Level 3: Inference",
             "Email", "Profile URL"
         ])
         csv = df.to_csv(index=False).encode("utf-8")
